@@ -1,0 +1,37 @@
+[project]
+name = "vidsage"
+version = "0.1.0"
+description = "AI-powered YouTube lecture search and revision assistant using Whisper, embeddings, Qdrant, and RAG to retrieve exact lecture timestamps."
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "yt-dlp>=2024.12.23",
+    "faster-whisper>=1.0.3",
+    "sentence-transformers>=3.3.0",
+    "qdrant-client>=1.12.0",
+    "groq>=0.13.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "typer>=0.15.0",
+    "rich>=13.9.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.6.0",
+    "python-dotenv>=1.0.1",
+    "httpx>=0.28.0",
+]
+
+[project.scripts]
+ytrag = "ytrag.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-mock>=3.14.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["ytrag", "api"]
