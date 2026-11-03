@@ -207,6 +207,67 @@ def ingest(
 
 
 @app.command()
+def ask(
+    question: str = typer.Argument(..., help="Question in English or Hinglish (e.g. 'DSA Roadmap me kya bataya gaya hai?')"),
+    top_k: Optional[int] = typer.Option(None, "--top-k", "-k", help="Number of retrieved lecture chunks"),
+    threshold: Optional[float] = typer.Option(None, "--threshold", "-t", help="Relevance score threshold"),
+):
+    """Ask a question and receive a grounded answer with clickable lecture timestamps."""
+    from ytrag.answer import answer as generate_answer
+
+    console.print(f"\n[bold cyan]Question:[/bold cyan] {question}")
+
+    with console.status("[yellow]Searching lectures & generating grounded answer with Groq...[/yellow]"):
+        result = generate_answer(
+            question=question,
+            top_k=top_k,
+            max_distance=threshold,
+        )
+
+    # 1. Grounding Status
+    if result["grounded"]:
+        status_badge = "[bold white on green] GROUNDED ANSWER [/bold white on green]"
+    else:
+        status_badge = "[bold white on yellow] REFUSAL / UNGROUNDED [/bold white on yellow]"
+
+    console.print(f"\n{status_badge}\n")
+
+    # 2. Answer Text
+    console.print(
+        Panel(
+            result["answer"],
+            title="[bold green]VidSage Response[/bold green]",
+            border_style="green" if result["grounded"] else "yellow",
+        )
+    )
+
+    # 3. Citations Table
+    citations = result.get("citations", [])
+    if citations:
+        table = Table(title="Referenced Lecture Citations", show_lines=True)
+        table.add_column("Citation", style="bold cyan", width=10)
+        table.add_column("Lecture Title", style="cyan", width=30)
+        table.add_column("Timestamp", style="green", width=12)
+        table.add_column("Lecture Excerpt", style="white")
+        table.add_column("Clickable Jump Link", style="bold blue")
+
+        for c in citations:
+            excerpt = (c["text"][:150] + "...") if len(c["text"]) > 150 else c["text"]
+            table.add_row(
+                c["citation_id"],
+                c["title"],
+                c["timestamp"],
+                excerpt,
+                c["url"],
+            )
+
+        console.print(table)
+    else:
+        if result["grounded"]:
+            console.print("[dim]No specific citation referenced in the response.[/dim]")
+
+
+@app.command()
 def search(
     query: str = typer.Argument(..., help="Search query (e.g. 'two pointer approach' or Hinglish question)"),
     top_k: int = typer.Option(5, "--top-k", "-k", help="Number of retrieved results"),
@@ -261,6 +322,20 @@ def stats():
         console.print(table)
     except Exception as e:
         console.print(f"[red]Error fetching stats: {e}[/red]")
+
+
+@app.command(name="eval")
+def run_eval(
+    golden: Optional[Path] = typer.Option(None, "--golden", "-g", help="Path to golden.json evaluation dataset"),
+    top_k: int = typer.Option(5, "--top-k", "-k", help="Top-K retrieval limit"),
+):
+    """Run automated RAG evaluation against the golden dataset (hit rate, refusal accuracy, timestamp error)."""
+    from ytrag.evaluate import run_evaluation
+
+    try:
+        run_evaluation(golden_path=golden, top_k=top_k)
+    except Exception as e:
+        console.print(f"[bold red]Evaluation failed: {e}[/bold red]")
 
 
 @app.command()

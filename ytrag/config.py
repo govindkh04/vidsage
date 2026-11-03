@@ -43,7 +43,7 @@ class Settings(BaseSettings):
 
     # Retrieval
     top_k: int = Field(default=6, alias="YTRAG_TOP_K")
-    max_distance: float = Field(default=0.5, alias="YTRAG_MAX_DISTANCE")
+    max_distance: float = Field(default=0.40, alias="YTRAG_MAX_DISTANCE")
 
     # LLM Settings
     llm_model: str = Field(default="openai/gpt-oss-120b", alias="YTRAG_LLM_MODEL")
