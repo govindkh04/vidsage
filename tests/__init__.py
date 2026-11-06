@@ -1,1 +1,0 @@
-"""VidSage automated test suite."""

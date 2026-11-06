@@ -1,267 +1,411 @@
 # VidSage
 
-> **Your videos. Your knowledge. Instantly.**
+VidSage searches timestamped transcripts of DSA lectures and takes you to the
+relevant moment in the video. Ask in English or Hinglish, browse ranked
+transcript matches, and request a summary grounded in the retrieved excerpts.
 
-VidSage is an AI-powered YouTube lecture search and revision assistant. It converts educational YouTube playlists into searchable, timestamp-aware knowledge, enabling students and engineers to pinpoint the exact explanation, video, and timestamp for any concept in seconds.
+The project includes 126 transcript JSON files. Build a local search index from
+them without downloading lecture audio or running speech recognition.
 
----
+## Features
 
-## 📌 Problem Statement
+- Semantic search over timestamped lecture excerpts.
+- Clickable results that play at the matching point in an embedded YouTube
+  player.
+- Optional grounded answers and summaries using Groq or Gemini.
+- Local Qdrant storage by default; Qdrant Cloud is optional.
+- CLI workflows to ingest playlists, cache transcripts, rebuild the index, and
+  evaluate retrieval.
+- Re-runnable ingestion with cached transcripts and deterministic Qdrant point
+  IDs.
 
-Students watch hundreds of hours of video lectures (such as Data Structures & Algorithms, Machine Learning, and System Design playlists). When revising for examinations or technical interviews, finding where a specific topic or subtle nuance was explained (e.g. *Memoization vs Tabulation*, *Dijkstra's time complexity*) is tedious. Standard YouTube search only searches titles, descriptions, and coarse caption keywords without jumping directly to the exact timestamp where the explanation takes place.
-
-VidSage solves this problem by transcribing lecture playlists with high-fidelity speech-to-text (**faster-whisper**), chunking transcripts with precise timestamp boundaries, generating dense vector embeddings (**BAAI/bge-m3**), indexing them in **Qdrant Cloud**, and providing grounded LLM answers (**Groq / openai/gpt-oss-120b**) with clickable citations that jump directly to that moment inside an embedded YouTube player.
-
----
-
-## 🏗️ Architecture & Pipeline Workflow
+## How it works
 
 ```mermaid
-flowchart TD
-    subgraph Offline_Ingestion["Offline Ingestion Pipeline"]
-        A[YouTube Playlist URL] --> B[Playlist Extraction yt-dlp]
-        B --> C[Native Audio Download m4a]
-        C --> D[Whisper Transcription large-v3 / small]
-        D --> E[Atomic Cache ~/.ytrag/transcripts/]
-        E --> F[Time-based Chunking 75s / 15s overlap]
-        F --> G[Embedding Generation BAAI/bge-m3]
-        G --> H[(Qdrant Cloud Vector DB)]
-    end
+flowchart LR
+    U[Question] --> UI[Web UI or CLI]
+    UI --> E[Local sentence-transformers embedder]
+    E --> Q[Qdrant vector search]
+    Q --> R[Ranked transcript chunks with timestamps]
+    R --> UI
+    R --> L[Optional Groq or Gemini answer]
+    L --> UI
+    UI --> Y[YouTube embedded player]
 
-    subgraph Online_Serving["Online Question Answering & Retrieval"]
-        I[User Question English/Hinglish] --> J[FastAPI / CLI]
-        J --> K[Query Embedding BGE-M3]
-        K --> H
-        H --> L[Top-K Segment Retrieval & Score Filter]
-        L --> M[Groq LLM openai/gpt-oss-120b]
-        M --> N[Citation Validation & 5s Rewind Offset]
-        N --> O[React Frontend]
-        O --> P[YouTube IFrame Player Seek]
-    end
+    P[YouTube playlist] --> D[yt-dlp audio download]
+    D --> W[faster-whisper transcription]
+    W --> C[Time-based chunking]
+    C --> E
+    T[Cached or bundled transcript JSON] --> C
 ```
 
----
+The embedder runs locally. Qdrant stores vectors and transcript payloads either
+in a local on-disk database or in a configured cloud collection. Search does
+not call an LLM; the `/ask` endpoint does.
 
-## 🛠️ Technology Stack
+## Tech stack
 
-| Layer | Component | Technology | Rationale |
-|---|---|---|---|
-| **Audio & Speech** | Audio Extraction | `yt-dlp` | Fast native `.m4a` extraction without unnecessary transcoding |
-| | Transcription | `faster-whisper` | CTranslate2 inference engine with float timestamp fidelity |
-| **Vector Search** | Dense Embeddings | `sentence-transformers` (`BAAI/bge-m3`) | SOTA multi-lingual & cross-lingual 1024-dim representations |
-| | Vector Database | `Qdrant Cloud` | Cloud vector engine with Cosine distance and payload filtering |
-| **LLM Reasoning** | Inference Provider | `Groq` | Sub-second ultra-low latency response generation |
-| | Foundation Model | `openai/gpt-oss-120b` | High factual grounding and natural Hinglish/English reasoning |
-| **Backend & CLI** | Framework | `FastAPI` + `Uvicorn` | Asynchronous REST API with Pydantic v2 schemas and rate limiting |
-| | CLI Tool | `Typer` + `Rich` | Beautiful interactive terminal interface |
-| | Package Manager | `uv` (Python 3.11) | Ultra-fast Rust-based Python dependency management |
-| **Frontend** | UI Framework | `React` + `Vite` + `Tailwind CSS` | Modern responsive dark-mode UI with Lucide React icons |
-| | Video Playback | YouTube IFrame Player API | In-page embedded video player with millisecond seek navigation |
+| Area | Technology |
+|---|---|
+| Language | Python 3.11 or 3.12 |
+| Dependency management | [uv](https://docs.astral.sh/uv/) |
+| Playlist metadata and audio | `yt-dlp` |
+| Transcription | `faster-whisper` / CTranslate2 |
+| Time-aware chunking | Project implementation in `ytrag/chunk.py` |
+| Local embeddings | `sentence-transformers`; default `all-MiniLM-L6-v2` |
+| Vector database | Qdrant client: embedded local storage or Qdrant Cloud |
+| Optional answer generation | Groq or Google Gemini APIs |
+| CLI | Typer and Rich |
+| HTTP API | FastAPI, Pydantic, and Uvicorn |
+| Browser playback | YouTube IFrame Player API, with an embedded-player fallback |
 
----
-
-## 📂 Project Structure
+## Repository structure
 
 ```text
-vidsage/
-├── ytrag/                      # Core AI & RAG Engine
-│   ├── __init__.py
-│   ├── config.py              # Pydantic Settings & path resolution
-│   ├── models.py              # Video, Segment, Chunk, and Citation models
-│   ├── playlist.py            # yt-dlp metadata extraction & audio downloader
-│   ├── transcribe.py          # faster-whisper atomic caching pipeline
-│   ├── chunk.py               # Time-based boundary chunking & hallucination filter
-│   ├── embed.py               # BAAI/bge-m3 dense embedder abstraction
-│   ├── index.py               # High-level Qdrant vector operations
-│   ├── answer.py              # Grounded RAG answering & citation validation
-│   ├── evaluate.py            # Evaluation metrics (hit rate, refusal accuracy)
-│   ├── services/
-│   │   ├── qdrant_service.py  # Qdrant client connection & collection management
-│   │   └── groq_service.py    # Groq API completion wrapper
-│   └── cli.py                 # Typer Rich CLI commands
-│
-├── api/                       # FastAPI REST API Backend
-│   ├── __init__.py
-│   ├── main.py                # App entrypoint, CORS, logging, lifespan
-│   ├── routes/
-│   │   ├── health.py          # GET /health
-│   │   ├── ask.py             # POST /ask
-│   │   ├── search.py          # POST /search
-│   │   ├── videos.py          # GET /videos, GET /videos/{video_id}
-│   │   └── playlists.py       # GET /playlists
-│   ├── schemas/
-│   │   ├── request.py         # AskRequest, SearchRequest
-│   │   └── response.py        # AskResponse, HealthResponse, VideoItem
-│   └── services/
-│       └── rate_limiter.py    # Sliding-window in-memory IP rate limiter
-│
-├── frontend/                  # React + Vite Frontend
-│   ├── src/
-│   │   ├── components/
-│   │   │   ├── Navbar.jsx
-│   │   │   ├── SearchBar.jsx
-│   │   │   ├── AnswerCard.jsx
-│   │   │   ├── CitationCard.jsx
-│   │   │   ├── VideoPlayer.jsx
-│   │   │   ├── VideoResult.jsx
-│   │   │   └── LoadingState.jsx
-│   │   ├── hooks/
-│   │   │   └── useYouTubePlayer.js # YouTube IFrame API seek hook
-│   │   ├── services/
-│   │   │   └── api.js         # HTTP client
-│   │   ├── App.jsx            # Main view & layout
-│   │   ├── main.jsx
-│   │   └── index.css
-│   ├── package.json
-│   └── vite.config.js
-│
+VidSage/
+├── api/
+│   ├── main.py                 # FastAPI app, endpoints, and startup
+│   └── static/
+│       └── index.html          # Single-page search UI and YouTube player
 ├── eval/
-│   └── golden.json            # Benchmark test dataset
-├── tests/
-│   ├── test_chunk.py          # Chunking & hallucination unit tests
-│   ├── test_transcribe.py     # Atomic caching unit tests
-│   ├── test_answer.py         # Citation extraction & refusal tests
-│   └── test_api.py            # FastAPI endpoint tests
-│
-├── transcripts/               # Exported distribution transcripts
-├── .env.example               # Configuration template
-├── pyproject.toml             # Python package configuration
-└── README.md
+│   ├── golden.json             # Default retrieval/refusal evaluation set
+│   └── golden_draft.json       # Draft retrieval examples; not used by default
+├── index/                      # Optional exported vector index (not included)
+├── transcripts/                # 126 bundled transcript JSON files
+├── ytrag/
+│   ├── answer.py               # Retrieval, grounded answers, citations
+│   ├── chunk.py                # Time-window chunking and repetition filtering
+│   ├── cli.py                  # Typer CLI commands
+│   ├── config.py               # Environment configuration and runtime paths
+│   ├── embed.py                # Sentence-transformers embedder
+│   ├── evaluate.py             # Golden-set evaluation
+│   ├── index.py                # Qdrant collection, search, and vector export
+│   ├── models.py               # Video, segment, chunk, timestamp models
+│   ├── playlist.py             # yt-dlp playlist/audio operations
+│   ├── transcribe.py           # Whisper transcription and transcript cache
+│   └── util.py                 # Network retry and connectivity helpers
+├── .env.example                # Safe configuration template
+├── .gitignore                  # Excludes local secrets and generated files
+├── .python-version             # uv's Python version hint (3.11)
+├── main.py                     # Convenience CLI entry point
+├── pyproject.toml              # Dependencies and CLI entry point
+└── uv.lock                     # Locked dependency resolution
 ```
 
----
+The generated Qdrant database, downloaded audio, and live transcript cache are
+stored outside the repository by default under `~/.ytrag/`. The `index/`
+directory in this checkout does not contain a prebuilt vector file; create the
+index from `transcripts/` with the setup steps below.
 
-## 🚀 Quick Start (Development)
+## Installation
 
-### Prerequisites
+### Requirements
 
-- **Python 3.11** (managed via `uv`)
-- **uv**: `winget install astral-sh.uv` or `curl -LsSf https://astral.sh/uv/install.sh | sh`
-- **Node.js 18+** & `npm`
-- **Groq API Key**: Free at [console.groq.com](https://console.groq.com)
-- **Qdrant Cloud Account**: Free cluster at [cloud.qdrant.io](https://cloud.qdrant.io)
+- Python 3.11 or 3.12
+- [uv](https://docs.astral.sh/uv/getting-started/installation/)
+- Internet access on first run to download Python packages and the embedding
+  model
 
----
+### 1. Clone and install
 
-### 1. Environment Setup
+Replace the placeholder with your GitHub repository URL:
 
-```powershell
-# Clone the repository
-git clone https://github.com/govindkh04/vidsage.git
-cd vidsage
-
-# Create Python 3.11 virtual environment
+```bash
+git clone https://github.com/<YOUR-USERNAME>/VidSage.git
+cd VidSage
+uv python install 3.11
 uv venv --python 3.11
-
-# Install backend dependencies
 uv sync
-
-# Configure environment variables
-cp .env.example .env
 ```
 
-Edit `.env` and fill in your credentials:
-```env
-GROQ_API_KEY=gsk_...
-QDRANT_URL=https://your-cluster-id.aws.cloud.qdrant.io
-QDRANT_API_KEY=eyJ...
-```
+On Windows, if the project is in OneDrive and `uv sync` reports a hardlink or
+cloud-file error, use copy mode:
 
----
-
-### 2. Verify Preflight Diagnostics
-
-Run the preflight health check to verify all services and credentials:
 ```powershell
-uv run ytrag preflight
+uv sync --link-mode=copy
 ```
 
----
+Use `uv run --link-mode=copy` for the commands below in that environment.
 
-### 3. Ingest Video Lectures
+### 2. Configure an LLM key (optional for search)
 
-Ingest a single lecture or an entire playlist into the knowledge base:
+Copy the example file and add a Groq **or** Gemini key:
+
 ```powershell
-# Ingest single video
-uv run ytrag ingest --video "S8tpzqrwnHk" --model small
+Copy-Item .env.example .env
+notepad .env
+```
 
-# Ingest first N videos from playlist
-uv run ytrag ingest --playlist "https://youtube.com/playlist?list=PLbJhGqY-mq47k_WLUtzVjmarUm1EuXPj2" --limit 3
+On macOS or Linux, use `cp .env.example .env` and edit `.env` with your editor.
+Keep `.env` private; it is excluded by `.gitignore`.
 
-# View indexing statistics
+Timestamp search works without an LLM key. The web app requests a generated
+summary after a successful search, so configure a key to use that feature.
+
+### 3. Build the local vector index
+
+From the repository root:
+
+```bash
+uv run ytrag reindex --transcripts transcripts
+```
+
+This embeds the bundled transcripts and writes the index to local Qdrant
+storage. The first run downloads the embedding model; subsequent queries reuse
+the cached model. No GPU, Qdrant account, or audio download is needed for this
+step.
+
+### 4. Start the web app
+
+```bash
+uv run ytrag serve
+```
+
+Wait for the embedding model to load, then open
+[http://127.0.0.1:8000](http://127.0.0.1:8000). Stop the server with `Ctrl+C`.
+The local embedded Qdrant database is single-process: stop `serve` before
+running CLI commands that access that same database.
+
+> **Windows/OneDrive:** If you needed copy mode during installation, run the
+> commands as `uv run --link-mode=copy ytrag ...`, for example
+> `uv run --link-mode=copy ytrag serve`.
+
+## Configuration
+
+The application loads `.env` from the current directory and reads settings
+through `ytrag/config.py`. A Qdrant account is not required for local use.
+
+### Secrets and service selection
+
+```dotenv
+# Add one key to enable generated summaries / answers.
+GROQ_API_KEY=
+GEMINI_API_KEY=
+
+# Optional. Leave blank to use local Qdrant storage.
+QDRANT_URL=
+QDRANT_API_KEY=
+
+# Optional: groq, gemini, or none.
+# If omitted, Gemini is selected when GEMINI_API_KEY (or GOOGLE_API_KEY) is
+# present; otherwise Groq is selected when GROQ_API_KEY is present.
+# YTRAG_LLM_BACKEND=
+```
+
+`GEMINI_API_KEY` and the Google SDK-compatible `GOOGLE_API_KEY` are accepted.
+If both provider keys are present and `YTRAG_LLM_BACKEND` is unset, Gemini is
+selected. Leave `QDRANT_URL` blank for the local database at
+`~/.ytrag/qdrant`; set both `QDRANT_URL` and `QDRANT_API_KEY` to use a hosted
+Qdrant cluster.
+
+### Environment variables
+
+All settings are optional; the defaults below are used when omitted.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GROQ_API_KEY` | unset | Groq API key for generated answers |
+| `GEMINI_API_KEY` / `GOOGLE_API_KEY` | unset | Gemini API key |
+| `YTRAG_LLM_BACKEND` | auto / `none` | Select `groq`, `gemini`, or `none` |
+| `YTRAG_LLM_MODEL` | provider default | Override the selected provider's model |
+| `YTRAG_GROQ_MODEL` | `openai/gpt-oss-120b` | Groq model |
+| `YTRAG_GEMINI_MODEL` | `gemini-2.0-flash` | Gemini model |
+| `QDRANT_URL` | unset | Use Qdrant Cloud instead of local storage |
+| `QDRANT_API_KEY` | unset | Authentication for hosted Qdrant |
+| `YTRAG_ROOT` | `~/.ytrag` | Root for runtime data |
+| `YTRAG_QDRANT_PATH` | `~/.ytrag/qdrant` | Local Qdrant database path |
+| `YTRAG_COLLECTION` | `dsa_lectures` | Base collection name; embedding dimension is appended |
+| `YTRAG_EMBED_MODEL` | `all-MiniLM-L6-v2` | Sentence-transformers model |
+| `YTRAG_EMBED_BATCH` | `16` | Embedding batch size |
+| `YTRAG_EMBED_QUERY_PREFIX` | empty | Optional prefix applied to query text |
+| `YTRAG_TOP_K` | `6` | Default number of search results |
+| `YTRAG_MAX_DISTANCE` | `0.6` | Maximum cosine distance passed to answer generation |
+| `YTRAG_CONFIDENT_DISTANCE` | `0.45` | Distance threshold for the UI's confidence indicator |
+| `YTRAG_TITLE_BOOST` | `0.06` | Ranking boost per meaningful title/query term overlap |
+| `YTRAG_WHISPER_MODEL` | `large-v3` | faster-whisper model |
+| `YTRAG_WHISPER_DEVICE` | `auto` | `auto`, `cuda`, or `cpu` |
+| `YTRAG_WHISPER_COMPUTE` | auto | Compute type; defaults to `float16` on CUDA or `int8` on CPU |
+| `YTRAG_WHISPER_LANG` | `en` | Whisper transcription language |
+| `YTRAG_WHISPER_BEAM` | `5` | Whisper beam size |
+| `YTRAG_WHISPER_BATCH` | `8` | Batched inference size; `0` disables batching |
+| `YTRAG_CHUNK_SECONDS` | `75` | Target chunk time window |
+| `YTRAG_CHUNK_OVERLAP` | `15` | Chunk overlap in seconds |
+| `YTRAG_MIN_CHUNK_WORDS` | `15` | Minimum words for a chunk |
+| `YTRAG_LINK_REWIND` | `5` | Seconds to rewind citation/player links |
+| `YTRAG_UPSERT_BATCH` | `128` | Qdrant upsert batch size |
+| `YTRAG_DOWNLOAD_SLEEP_MIN` / `YTRAG_DOWNLOAD_SLEEP_MAX` | `2` / `6` | Minimum and maximum delay between downloads, in seconds |
+| `YTRAG_COOKIES_FILE` | unset | Optional yt-dlp `cookies.txt` path |
+| `YTRAG_COOKIES_FROM_BROWSER` | unset | Optional browser cookie source |
+| `YTRAG_MAX_QUESTION_CHARS` | `500` | API question length limit |
+| `YTRAG_RATE_LIMIT_REQUESTS` | `20` | `/ask` requests allowed per client per window |
+| `YTRAG_RATE_LIMIT_WINDOW` | `60` | `/ask` rate-limit window in seconds |
+
+## Usage
+
+### Search and ask from the CLI
+
+```bash
+# Retrieve timestamped transcript matches without an LLM call
+uv run ytrag search "sliding window kab use kare"
+
+# Generate a grounded answer (requires a configured Groq or Gemini key)
+uv run ytrag ask "memoization aur tabulation me kya difference hai?"
+
+# Show index and per-video statistics
 uv run ytrag stats
 ```
 
-> **Note on Caching**: Transcripts are saved permanently in `~/.ytrag/transcripts/`. If you re-run ingestion, audio downloading and transcription are automatically skipped, and chunks are upserted idempotently with deterministic UUIDs.
+### Use the web interface
 
----
-
-### 4. Ask Questions via CLI
-
-Ask questions in English or Hinglish from your terminal:
-```powershell
-# Grounded question
-uv run ytrag ask "Video schedule aur consistency ke baare me kya bataya gaya hai?"
-
-# Out-of-domain query (triggers automatic refusal)
-uv run ytrag ask "React hooks kaise kaam karte hain?"
-
-# Direct semantic retrieval without LLM
-uv run ytrag search "DSA patterns roadmap beginner"
+```bash
+uv run ytrag serve
 ```
 
----
+Enter a question in English or Hinglish. VidSage searches the index, shows
+ranked moments, and loads the best match in the video player. With an LLM key
+configured, it also requests a grounded summary. If a summary cannot be
+generated, the UI shows the error and offers a retry.
 
-### 5. Run the Automated Evaluation Suite
+### Ingest a different playlist
 
-VidSage includes a ground-truth benchmark verifying Hit Rate @ 5, Refusal Accuracy, and Timestamp Error:
-```powershell
-uv run ytrag eval
+The bundled transcripts are sufficient to try the application. To index a
+different playlist, configure `YTRAG_WHISPER_LANG` as appropriate, then run:
+
+```bash
+# Check recognition in both configured language modes on one video
+uv run ytrag langtest "https://www.youtube.com/watch?v=<VIDEO_ID>"
+
+# Try a single video before starting a full playlist
+uv run ytrag ingest --playlist "<PLAYLIST_URL>" --limit 1
+
+# Ingest the playlist
+uv run ytrag ingest --playlist "<PLAYLIST_URL>"
 ```
 
-Run all unit and API tests with `pytest`:
-```powershell
-uv run pytest -v
+Ingestion downloads audio, reuses cached transcripts when available,
+transcribes missing videos, chunks the segments, and upserts the vectors. Audio
+is deleted after transcription unless `--keep-audio` is used. A GPU is
+recommended for a large playlist; the CPU path is supported but slower. The
+optional CUDA dependencies can be installed with `uv sync --extra cuda`.
+
+Useful ingestion options:
+
+| Option | Effect |
+|---|---|
+| `--limit N` | Process only the first `N` playlist videos |
+| `--skip-transcribe` | Skip videos without cached transcripts |
+| `--keep-audio` | Keep downloaded audio after transcription |
+| `--force` | Re-transcribe even when a transcript is cached |
+| `--stop-after-failures N` | Stop after `N` consecutive video failures; default `5` |
+
+### Rebuild or manage the index
+
+```bash
+# Re-chunk and re-embed available transcripts; does not transcribe
+uv run ytrag reindex
+
+# Rebuild from a specific transcript folder
+uv run ytrag reindex --transcripts transcripts
+
+# Remove existing chunks per video first (useful after changing chunk settings)
+uv run ytrag reindex --replace
+
+# Check transcript-ingestion progress, then clean cached audio if desired
+uv run ytrag progress
+uv run ytrag clean-audio
 ```
 
----
+`reindex` uses the live transcript cache when present, otherwise it falls back
+to the bundled `transcripts/` directory. Changing the embedding model or chunk
+settings requires rebuilding the index; the embedding dimension is part of the
+Qdrant collection name.
 
-### 6. Start the Backend API Server
+### Evaluate retrieval
 
-Start the FastAPI backend with hot reloading:
-```powershell
-uv run uvicorn api.main:app --reload --port 8000
+```bash
+uv run ytrag eval --verbose
 ```
-- API Base URL: `http://localhost:8000`
-- Interactive Swagger Docs: `http://localhost:8000/docs`
 
----
+The default `eval/golden.json` contains refusal checks and retrieval templates.
+Add real retrieval entries with expected video IDs and timestamps for useful
+retrieval accuracy measurements. `eval/golden_draft.json` contains draft
+examples but is not selected by default; pass it explicitly with
+`uv run ytrag eval --path eval/golden_draft.json`.
+There is no separate automated unit-test suite in the current repository.
 
-### 7. Start the React Frontend
+## HTTP API
 
-In a separate terminal:
-```powershell
-cd frontend
-npm install
-npm run dev
+Start the API and UI with `uv run ytrag serve`. FastAPI's interactive
+documentation is available at `/docs`; the OpenAPI schema is at `/openapi.json`.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/` | Serves the VidSage web UI |
+| `GET` | `/health` | Basic app/model health information |
+| `GET` | `/meta` | Indexed lecture count and total indexed hours |
+| `GET` | `/stats` | Collection name, existence, chunk count, and embedding details |
+| `POST` | `/search` | Retrieve timestamped chunks; no LLM required |
+| `POST` | `/ask` | Generate a grounded answer with citations; requires an LLM key |
+
+Both `POST` endpoints accept the same JSON body. `top_k` is optional and must
+be between 1 and 20; `question` must contain 1–500 characters by default.
+
+```json
+{
+  "question": "memoization aur tabulation me kya difference hai?",
+  "top_k": 6
+}
 ```
-Open **`http://localhost:5173`** in your browser!
 
-1. Type any question (e.g. *"Video schedule ke baare me kya bataya gaya hai?"*).
-2. Read the concise, grounded answer.
-3. Click any citation card: **the embedded video player immediately loads the exact lecture and seeks 5 seconds before the explanation!**
+`POST /search` returns a `query`, a `confident` indicator, and ranked `results`.
+Each result contains a lecture `title`, `timestamp`, `video_id`, `start_sec`,
+`end_sec`, YouTube `url`, transcript `preview`, and vector `distance`.
 
----
+`POST /ask` returns an `answer`, `grounded` boolean, `retrieved` count, and
+`citations` array. A citation includes the lecture title, timestamp, video ID,
+YouTube URL, start time, and distance. The `/ask` route is rate-limited per
+client in the current process; `/search` is not.
 
-## 🔒 Security & Grounding Philosophy
+## Screenshots and demo
 
-1. **Zero Hallucination Guarantee**: If retrieved segments do not pass the relevance similarity threshold, the model refuses to answer (`"Ye topic in lectures me cover nahi hua."`).
-2. **Citation Validation**: Any citation reference emitted by the LLM (`[1]`, `[2]`) is verified against retrieved chunks. Ungrounded citations are rejected.
-3. **No Secret Leaks**: Credentials (`GROQ_API_KEY`, `QDRANT_API_KEY`) remain strictly on the backend and are never passed to the frontend.
-4. **Rate Limiting**: The `/ask` endpoint enforces in-memory rate limiting (30 requests/minute per IP).
+No hosted demo URL or screenshot asset is currently included in this repository.
+Add a screenshot under `docs/` and link it here when one is available.
 
----
+## Future improvements
 
-## 📄 License
+- Add a real, maintained retrieval golden set and automated unit tests.
+- Update `preflight` to validate whichever LLM and Qdrant backends are selected.
+- Move API rate-limit state to shared storage before deploying multiple workers.
+- Add a deployment configuration and a hosted demo.
 
-MIT License. See [LICENSE](LICENSE) for details.
+## Troubleshooting
+
+- **`uv sync` hardlink/cloud-file error on Windows:** retry with
+  `uv sync --link-mode=copy`; use `uv run --link-mode=copy ...` for commands.
+- **`GROQ_API_KEY` or `GEMINI_API_KEY` missing:** search still works, but
+  summaries and `ytrag ask` need a provider key in `.env`.
+- **Local Qdrant storage already accessed:** stop the running `ytrag serve`
+  process before running CLI commands against the same local database. Use
+  hosted Qdrant if multiple processes need concurrent access.
+- **Embedding model mismatch:** keep the same `YTRAG_EMBED_MODEL` used to build
+  the index, or rebuild it with `ytrag reindex`.
+- **`ytrag preflight` reports missing Groq/Qdrant URL:** the current preflight
+  implementation explicitly checks `GROQ_API_KEY` and `QDRANT_URL`, even
+  though Gemini and local Qdrant are supported. This check can therefore fail
+  for valid local/Gemini configurations.
+- **YouTube player does not embed:** browser extensions, network policy, or
+  video-owner settings may block playback. The UI provides an embedded-player
+  fallback when the IFrame API is unavailable; some videos may still only play
+  on YouTube.
+
+## Contributing
+
+Issues and pull requests are welcome. For changes, include a concise
+description of the behavior changed and the commands or evaluation used to
+verify it. Keep credentials in `.env`; do not commit secrets.
+
+## License
+
+This repository currently has no `LICENSE` file. Do not assume it is available
+under an open-source license; add a license before redistributing or reusing the
+project.

@@ -1,194 +1,202 @@
+"""Audio -> Segment[], cached to JSON.
+
+The cache check at the top of transcribe() is the single most important line
+in this codebase. Re-transcribing a 40-video playlist by accident costs hours.
+"""
+
 import json
-import logging
 import os
 from pathlib import Path
-from typing import Optional
-from faster_whisper import WhisperModel
 
-from ytrag.config import settings
+from ytrag.config import (
+    TRANSCRIPT_DIR,
+    WHISPER_BATCH,
+    WHISPER_BEAM,
+    WHISPER_COMPUTE,
+    WHISPER_DEVICE,
+    WHISPER_LANG,
+    WHISPER_MODEL,
+)
 from ytrag.models import Segment, Video
+from ytrag.playlist import delete_audio, download_audio
 
-logger = logging.getLogger("ytrag.transcribe")
-
-# Cache model instance in memory so multiple calls do not reload the weights
-_cached_whisper_model: Optional[WhisperModel] = None
-_cached_model_key: Optional[str] = None
+# Loading large-v3 takes a while, so keep one instance per (model, device).
+_MODEL_CACHE: dict[tuple, object] = {}
 
 
-def get_whisper_model(
-    model_name: Optional[str] = None,
-    device: Optional[str] = None,
-    compute_type: Optional[str] = None,
-) -> WhisperModel:
-    """Get or load a cached WhisperModel instance with CPU fallback support."""
-    global _cached_whisper_model, _cached_model_key
+def _resolve_device() -> tuple[str, str]:
+    """Pick device and compute type, preferring CUDA when it actually works."""
+    device = WHISPER_DEVICE
+    if device == "auto":
+        try:
+            import ctranslate2
 
-    selected_model = model_name or settings.whisper_model
-    selected_device = device or settings.resolved_device
-    selected_compute = compute_type or settings.resolved_compute_type
+            device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+        except Exception:
+            device = "cpu"
 
-    model_key = f"{selected_model}:{selected_device}:{selected_compute}"
-    if _cached_whisper_model is not None and _cached_model_key == model_key:
-        return _cached_whisper_model
+    compute = WHISPER_COMPUTE or ("float16" if device == "cuda" else "int8")
+    return device, compute
 
-    logger.info(
-        f"Loading faster-whisper model '{selected_model}' on {selected_device.upper()} "
-        f"with compute_type='{selected_compute}'..."
-    )
+
+def get_model(model_name: str = WHISPER_MODEL):
+    """Load (and cache) a faster-whisper model, falling back to CPU if CUDA fails.
+
+    A GPU newer than the shipped ctranslate2 build will load and then fail at
+    the first inference, so the fallback here is deliberately broad.
+    """
+    from faster_whisper import WhisperModel
+
+    device, compute = _resolve_device()
+    key = (model_name, device, compute)
+    if key in _MODEL_CACHE:
+        return _MODEL_CACHE[key]
 
     try:
-        model = WhisperModel(
-            selected_model,
-            device=selected_device,
-            compute_type=selected_compute,
-        )
-    except Exception as e:
-        if selected_device == "cuda":
-            logger.warning(
-                f"CUDA loading failed ({e}). Falling back to CPU with compute_type='int8'..."
-            )
-            model = WhisperModel(
-                selected_model,
-                device="cpu",
-                compute_type="int8",
-            )
-            model_key = f"{selected_model}:cpu:int8"
-        else:
-            raise e
+        model = WhisperModel(model_name, device=device, compute_type=compute)
+    except Exception as exc:
+        if device == "cpu":
+            raise
+        print(f"[transcribe] CUDA unavailable ({exc}); falling back to CPU int8.")
+        device, compute = "cpu", "int8"
+        key = (model_name, device, compute)
+        model = WhisperModel(model_name, device=device, compute_type=compute)
 
-    _cached_whisper_model = model
-    _cached_model_key = model_key
+    _MODEL_CACHE[key] = model
     return model
 
 
-def get_transcript_cache_path(video_id: str) -> Path:
-    """Get the cached transcript path for a video."""
-    return settings.transcripts_dir / f"{video_id}.json"
+def get_batched_model(model_name: str = WHISPER_MODEL):
+    """Wrap the model in faster-whisper's batched pipeline.
+
+    Same weights, same output quality — it just feeds several VAD-detected
+    speech regions through the encoder at once instead of one at a time.
+    """
+    from faster_whisper import BatchedInferencePipeline
+
+    model = get_model(model_name)
+    key = ("batched", id(model))
+    if key not in _MODEL_CACHE:
+        _MODEL_CACHE[key] = BatchedInferencePipeline(model=model)
+    return _MODEL_CACHE[key]
 
 
-def load_cached_transcript(video_id: str) -> Optional[list[Segment]]:
-    """Load transcript segments from cache if file exists and is valid."""
-    path = get_transcript_cache_path(video_id)
-    if not path.is_file():
+def run_whisper(audio_path: str, language: str, model_name: str = WHISPER_MODEL):
+    """Transcribe one audio file. Returns (segment_iterator, info).
+
+    vad_filter drops silence outright, and condition_on_previous_text=False
+    stops Whisper's loop hallucination — on a long pause or a music sting it
+    otherwise repeats the previous phrase over and over. The batched pipeline
+    treats each speech region independently, so it never conditions on
+    previous text in the first place.
+    """
+    if WHISPER_BATCH > 0:
+        try:
+            return get_batched_model(model_name).transcribe(
+                audio_path,
+                language=language,
+                beam_size=WHISPER_BEAM,
+                batch_size=WHISPER_BATCH,
+                vad_filter=True,
+            )
+        except (ImportError, AttributeError, TypeError) as exc:
+            # Only fall back when this build of faster-whisper genuinely can't
+            # batch. Catching more than that would silently drop a long run to
+            # the sequential path — four times slower — on a transient error,
+            # with nothing in the output to say why it suddenly crawled.
+            print(f"[transcribe] batched pipeline unavailable ({exc}); using sequential.")
+
+    return get_model(model_name).transcribe(
+        audio_path,
+        language=language,
+        beam_size=WHISPER_BEAM,
+        condition_on_previous_text=False,
+        vad_filter=True,
+    )
+
+
+def transcript_path(video_id: str, directory: Path | None = None) -> Path:
+    return (directory or TRANSCRIPT_DIR) / f"{video_id}.json"
+
+
+def load_transcript(video_id: str, directory: Path | None = None) -> dict | None:
+    """Return the cached transcript dict, or None if absent/corrupt."""
+    path = transcript_path(video_id, directory)
+    if not path.exists():
         return None
-
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-
-        segments = [
-            Segment(
-                start=float(s["start"]),
-                end=float(s["end"]),
-                text=s["text"].strip(),
-            )
-            for s in data.get("segments", [])
-            if s.get("text", "").strip()
-        ]
-        logger.info(f"Loaded cached transcript for video {video_id} ({len(segments)} segments)")
-        return segments
-    except Exception as err:
-        logger.warning(f"Failed to read cached transcript for {video_id}: {err}. Will re-transcribe.")
+    except (json.JSONDecodeError, OSError):
         return None
+    if not isinstance(data, dict) or "segments" not in data:
+        return None
+    return data
 
 
-def save_transcript_atomic(
-    video: Video,
-    segments: list[Segment],
-    language: str,
-    model_name: str,
-) -> Path:
-    """Safely and atomically serialize transcript JSON using a temporary file and os.replace."""
-    target_path = get_transcript_cache_path(video.video_id)
-    temp_path = target_path.with_suffix(f".tmp.{os.getpid()}")
+def cached_video_ids(directory: Path | None = None) -> list[str]:
+    return sorted(p.stem for p in (directory or TRANSCRIPT_DIR).glob("*.json"))
 
+
+def segments_from_transcript(data: dict) -> list[Segment]:
+    return [
+        Segment(start=float(s["start"]), end=float(s["end"]), text=s["text"])
+        for s in data.get("segments", [])
+    ]
+
+
+def _write_transcript(video: Video, language: str, model_name: str, segments: list[Segment]) -> None:
+    """Write atomically.
+
+    A Ctrl-C part way through a plain write leaves a truncated JSON file that
+    the cache check then trusts forever. Temp file + os.replace makes the
+    transcript either fully there or not there at all.
+    """
     payload = {
         "video_id": video.video_id,
         "title": video.title,
         "language": language,
         "model": model_name,
-        "segments": [
-            {
-                "start": seg.start,
-                "end": seg.end,
-                "text": seg.text,
-            }
-            for seg in segments
-        ],
+        "duration": video.duration,
+        "segments": [{"start": s.start, "end": s.end, "text": s.text} for s in segments],
     }
-
-    # Write completely to temp file
-    with open(temp_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-
-    # Atomic rename prevents partial/corrupted files if interrupted
-    os.replace(temp_path, target_path)
-    logger.info(f"Saved transcript atomically to {target_path}")
-    return target_path
+    final = transcript_path(video.video_id)
+    tmp = final.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, final)
 
 
 def transcribe(
     video: Video,
-    audio_path: Path,
     force: bool = False,
-    language: Optional[str] = None,
-    model_name: Optional[str] = None,
+    language: str | None = None,
+    model_name: str = WHISPER_MODEL,
+    keep_audio: bool = False,
 ) -> list[Segment]:
-    """Transcribe audio file into timestamped Segment objects.
-    
-    Checks cached transcript first. Never re-transcribes if cache exists unless force is True.
-    """
-    # 1. Check cache
+    """Transcribe a video, using the cached transcript when one exists."""
+    language = language or WHISPER_LANG
+
     if not force:
-        cached = load_cached_transcript(video.video_id)
+        cached = load_transcript(video.video_id)
         if cached is not None:
-            return cached
+            return segments_from_transcript(cached)
 
-    # 2. Verify audio file exists
-    if not audio_path.is_file() or audio_path.stat().st_size == 0:
-        raise FileNotFoundError(f"Audio file not found or empty: {audio_path}")
+    audio_path = download_audio(video, force=force)
+    raw_segments, info = run_whisper(str(audio_path), language, model_name)
 
-    # 3. Load faster-whisper model
-    active_model_name = model_name or settings.whisper_model
-    model = get_whisper_model(model_name=active_model_name)
+    segments = [
+        Segment(start=float(s.start), end=float(s.end), text=s.text.strip())
+        for s in raw_segments
+        if s.text and s.text.strip()
+    ]
 
-    # 4. Transcribe audio stream
-    lang = language or (settings.whisper_lang if settings.whisper_lang != "auto" else None)
-    logger.info(f"Transcribing '{video.title}' [audio={audio_path.name}, lang={lang or 'auto'}]...")
+    if not video.duration and getattr(info, "duration", None):
+        video.duration = int(info.duration)
 
-    raw_segments, info = model.transcribe(
-        str(audio_path),
-        beam_size=settings.whisper_beam,
-        language=lang,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=500),
-    )
+    _write_transcript(video, language, model_name, segments)
 
-    detected_lang = info.language or "unknown"
-    logger.info(f"Whisper detected language: {detected_lang} (probability={info.language_probability:.2f})")
-
-    segments: list[Segment] = []
-    for s in raw_segments:
-        text = s.text.strip()
-        if text:
-            # Preserve raw float timestamps as returned by Whisper
-            segments.append(
-                Segment(
-                    start=float(s.start),
-                    end=float(s.end),
-                    text=text,
-                )
-            )
-
-    if not segments:
-        logger.warning(f"Whisper produced 0 segments for video {video.video_id}")
-
-    # 5. Save atomically to cache
-    save_transcript_atomic(
-        video=video,
-        segments=segments,
-        language=detected_lang,
-        model_name=active_model_name,
-    )
+    if not keep_audio:
+        delete_audio(video.video_id)
 
     return segments

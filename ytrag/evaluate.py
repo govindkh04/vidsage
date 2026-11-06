@@ -1,135 +1,127 @@
+"""Golden-set retrieval eval.
+
+This is the only way to tell whether a change actually improved retrieval or
+just felt better on the one query you kept re-testing. It takes half an hour
+to write the golden set and it produces a real number.
+
+Two kinds of entry:
+
+  {"q": "...", "expect_video_id": "abc123", "expect_around_sec": 724,
+   "tolerance_sec": 120}
+      A hit = the expected video appears in top-k AND at least one returned
+      chunk from it overlaps expect_around_sec +/- tolerance.
+
+  {"q": "React hooks kaise kaam karte hain?", "expect_refusal": true}
+      A hit = the full answer() pipeline refuses. This is the guard from
+      §6.5, and it is the part worth putting on camera.
+"""
+
 import json
-import logging
 from pathlib import Path
-from typing import Any, Optional
-from rich.console import Console
-from rich.table import Table
 
-from ytrag.answer import answer
-from ytrag.index import search as qdrant_search
+from ytrag.answer import answer, retrieve_only
+from ytrag.config import MAX_DISTANCE
 
-logger = logging.getLogger("ytrag.evaluate")
-console = Console(legacy_windows=False)
+DEFAULT_GOLDEN = Path(__file__).resolve().parent.parent / "eval" / "golden.json"
 
 
-def run_evaluation(golden_path: Optional[Path] = None, top_k: int = 5) -> dict[str, Any]:
-    """Execute automated evaluation against golden dataset."""
-    default_path = Path("eval/golden.json")
-    target_path = golden_path or default_path
+def load_golden(path: str | Path = DEFAULT_GOLDEN) -> list[dict]:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"No golden set at {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        entries = json.load(f)
+    # Entries starting with "_" are comments/templates in the shipped file.
+    return [e for e in entries if isinstance(e, dict) and not str(e.get("q", "")).startswith("_")]
 
-    if not target_path.is_file():
-        raise FileNotFoundError(f"Golden evaluation dataset not found at: {target_path}")
 
-    with open(target_path, "r", encoding="utf-8") as f:
-        cases = json.load(f)
+def _check_retrieval(entry: dict, k: int) -> dict:
+    hits = retrieve_only(entry["q"], top_k=k)
+    expected_id = entry["expect_video_id"]
+    around = entry.get("expect_around_sec")
+    tolerance = int(entry.get("tolerance_sec", 120))
 
-    total_cases = len(cases)
-    retrieval_cases = 0
-    retrieval_hits = 0
-    refusal_cases = 0
-    refusal_hits = 0
-    timestamp_errors: list[float] = []
-    results_detail: list[dict[str, Any]] = []
+    video_hit = any(chunk.video_id == expected_id for chunk, _ in hits)
 
-    console.print(f"[bold cyan]Running VidSage Evaluation ({total_cases} test cases)...[/bold cyan]\n")
-
-    for idx, case in enumerate(cases, start=1):
-        q = case["q"]
-        expect_refusal = case.get("expect_refusal", False)
-        expect_vid = case.get("expect_video_id")
-        expect_sec = case.get("expect_around_sec")
-        tolerance = case.get("tolerance_sec", 120)
-
-        if expect_refusal:
-            refusal_cases += 1
-            ans_res = answer(q, top_k=top_k)
-            # Refusal is successful if grounded is False or contains refusal text
-            is_refused = (not ans_res["grounded"]) or ("cover nahi hua" in ans_res["answer"].lower())
-            if is_refused:
-                refusal_hits += 1
-            results_detail.append(
-                {
-                    "case": idx,
-                    "query": q,
-                    "type": "Refusal Test",
-                    "status": "[green]PASSED[/green]" if is_refused else "[red]FAILED[/red]",
-                    "details": "Correctly refused" if is_refused else "Falsely grounded",
-                }
-            )
-        else:
-            retrieval_cases += 1
-            # Test vector retrieval
-            retrieved = qdrant_search(query=q, top_k=top_k)
-            hit = False
-            best_error = float("inf")
-
-            for r in retrieved:
-                if r.get("video_id") == expect_vid:
-                    start_s = r.get("start_sec", 0)
-                    end_s = r.get("end_sec", 0)
-                    if expect_sec is not None:
-                        err = abs(start_s - expect_sec)
-                        if err < best_error:
-                            best_error = err
-                        if (start_s - tolerance) <= expect_sec <= (end_s + tolerance):
-                            hit = True
-                            break
-                    else:
-                        hit = True
-                        break
-
-            if hit:
-                retrieval_hits += 1
-                if best_error != float("inf"):
-                    timestamp_errors.append(best_error)
-
-            results_detail.append(
-                {
-                    "case": idx,
-                    "query": q,
-                    "type": "Retrieval Test",
-                    "status": "[green]PASSED[/green]" if hit else "[red]FAILED[/red]",
-                    "details": f"Hit in top-{top_k} (error: {best_error:.0f}s)" if hit else f"Missed {expect_vid}",
-                }
-            )
-
-    # Calculate metrics
-    hit_rate = (retrieval_hits / retrieval_cases * 100) if retrieval_cases > 0 else 100.0
-    refusal_acc = (refusal_hits / refusal_cases * 100) if refusal_cases > 0 else 100.0
-    avg_ts_error = (sum(timestamp_errors) / len(timestamp_errors)) if timestamp_errors else 0.0
-
-    # Display results
-    table = Table(title="Evaluation Test Cases", show_lines=True)
-    table.add_column("#", width=4)
-    table.add_column("Type", width=16)
-    table.add_column("Query", width=36)
-    table.add_column("Status", width=12)
-    table.add_column("Details")
-
-    for r in results_detail:
-        table.add_row(
-            str(r["case"]),
-            r["type"],
-            r["query"],
-            r["status"],
-            r["details"],
+    time_hit = video_hit and around is None
+    if video_hit and around is not None:
+        lo, hi = around - tolerance, around + tolerance
+        # Overlap between [chunk.start, chunk.end] and [lo, hi].
+        time_hit = any(
+            chunk.video_id == expected_id and chunk.start_sec <= hi and chunk.end_sec >= lo
+            for chunk, _ in hits
         )
 
-    console.print(table)
-
-    summary_table = Table(title="Evaluation Summary Metrics")
-    summary_table.add_column("Metric", style="cyan")
-    summary_table.add_column("Score", style="bold green")
-
-    summary_table.add_row(f"Hit Rate @ {top_k}", f"{hit_rate:.1f}% ({retrieval_hits}/{retrieval_cases})")
-    summary_table.add_row("Refusal Accuracy", f"{refusal_acc:.1f}% ({refusal_hits}/{refusal_cases})")
-    summary_table.add_row("Avg Timestamp Offset", f"{avg_ts_error:.1f}s")
-
-    console.print(summary_table)
-
     return {
-        "hit_rate_at_k": hit_rate,
-        "refusal_accuracy": refusal_acc,
-        "avg_timestamp_error": avg_ts_error,
-        "total_cases": total_cases,
+        "q": entry["q"],
+        "kind": "retrieval",
+        "hit": bool(time_hit),
+        "video_hit": bool(video_hit),
+        "expected": expected_id,
+        "expect_around_sec": around,
+        "got": [
+            {
+                "video_id": chunk.video_id,
+                "title": chunk.video_title,
+                "timestamp": chunk.timestamp,
+                "start_sec": chunk.start_sec,
+                "end_sec": chunk.end_sec,
+                "distance": round(distance, 4),
+            }
+            for chunk, distance in hits
+        ],
     }
+
+
+def _check_refusal(entry: dict, k: int) -> dict:
+    result = answer(entry["q"], top_k=k)
+    refused = not result["grounded"]
+    return {
+        "q": entry["q"],
+        "kind": "refusal",
+        "hit": refused,
+        "answer": result["answer"],
+        "retrieved": result["retrieved"],
+    }
+
+
+def run_eval(path: str | Path = DEFAULT_GOLDEN, k: int = 5) -> dict:
+    entries = load_golden(path)
+    if not entries:
+        return {
+            "n": 0,
+            f"hit_rate_at_{k}": 0.0,
+            "results": [],
+            "misses": [],
+            "max_distance": MAX_DISTANCE,
+        }
+
+    results = []
+    for entry in entries:
+        if entry.get("expect_refusal"):
+            results.append(_check_refusal(entry, k))
+        else:
+            results.append(_check_retrieval(entry, k))
+
+    retrieval = [r for r in results if r["kind"] == "retrieval"]
+    refusal = [r for r in results if r["kind"] == "refusal"]
+    hits = sum(1 for r in results if r["hit"])
+
+    summary = {
+        "n": len(results),
+        f"hit_rate_at_{k}": round(hits / len(results), 4),
+        "max_distance": MAX_DISTANCE,
+        "results": results,
+        "misses": [r for r in results if not r["hit"]],
+    }
+    if retrieval:
+        summary["retrieval_hit_rate"] = round(
+            sum(1 for r in retrieval if r["hit"]) / len(retrieval), 4
+        )
+        summary["video_hit_rate"] = round(
+            sum(1 for r in retrieval if r["video_hit"]) / len(retrieval), 4
+        )
+    if refusal:
+        summary["refusal_rate"] = round(sum(1 for r in refusal if r["hit"]) / len(refusal), 4)
+
+    return summary

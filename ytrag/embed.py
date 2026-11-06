@@ -1,55 +1,95 @@
-import logging
-from typing import Optional
-from sentence_transformers import SentenceTransformer
+"""Pluggable embedder.
 
-from ytrag.config import settings
+One backend today (sentence-transformers), but everything downstream talks to
+the Protocol, so swapping the model is a config change plus `ytrag reindex`.
+"""
 
-logger = logging.getLogger("ytrag.embed")
+import contextlib
+import io
+import re
+import sys
+from typing import Protocol
+
+from ytrag.config import EMBED_BATCH, EMBED_MODEL, EMBED_QUERY_PREFIX
+
+# Noise the model loader prints from a compiled extension, which no env var
+# turns off. Filtered rather than suppressed wholesale: anything that is not
+# one of these still reaches stderr, so real failures are never hidden.
+_BENIGN = re.compile(
+    r"unauthenticated requests to the HF Hub|Loading weights:|^\s*$"
+)
 
 
-class Embedder:
-    """Embedding generation abstraction wrapping Sentence Transformers."""
+@contextlib.contextmanager
+def _quiet_load():
+    """Swallow the known-benign loader chatter, re-emit everything else."""
+    captured = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(captured):
+            yield
+    finally:
+        for line in captured.getvalue().splitlines():
+            if not _BENIGN.search(line):
+                print(line, file=sys.stderr)
 
-    def __init__(self, model_name: Optional[str] = None):
-        self.model_name = model_name or settings.embed_model
-        logger.info(f"Loading embedding model: {self.model_name}...")
-        self._model = SentenceTransformer(self.model_name)
-        # Determine vector dimensionality
-        test_vec = self._model.encode("test", normalize_embeddings=True)
-        self._dim = int(len(test_vec))
-        logger.info(f"Embedding model loaded. Dimension: {self._dim}")
 
-    @property
-    def dim(self) -> int:
-        """Vector dimensionality."""
-        return self._dim
+class Embedder(Protocol):
+    name: str
+    dim: int
 
-    def embed_documents(self, texts: list[str], batch_size: int = 32) -> list[list[float]]:
-        """Embed a list of chunk document texts with batching and normalization."""
+    def embed_documents(self, texts: list[str]) -> list[list[float]]: ...
+
+    def embed_query(self, text: str) -> list[float]: ...
+
+
+class SentenceTransformerEmbedder:
+    """Local embeddings. Default is bge-m3 (1024-dim, multilingual).
+
+    bge-m3 needs no instruction prefix. Some other models do, and only on the
+    query side — bge-*-en-v1.5 wants "Represent this sentence for searching
+    relevant passages: ". That is what EMBED_QUERY_PREFIX is for. Getting this
+    wrong degrades results silently: no error, just worse answers.
+    """
+
+    def __init__(self, model_name: str = EMBED_MODEL, batch_size: int = EMBED_BATCH):
+        from sentence_transformers import SentenceTransformer
+
+        self.name = model_name
+        self.batch_size = batch_size
+        with _quiet_load():
+            self.model = SentenceTransformer(model_name)
+        # Renamed in sentence-transformers 6; keep working on older pins too.
+        get_dim = getattr(self.model, "get_embedding_dimension", None) or (
+            self.model.get_sentence_embedding_dimension
+        )
+        self.dim = int(get_dim())
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        embeddings = self._model.encode(
+        vectors = self.model.encode(
             texts,
-            batch_size=batch_size,
+            batch_size=self.batch_size,
             normalize_embeddings=True,
-            show_progress_bar=len(texts) > 20,
+            show_progress_bar=False,
         )
-        return embeddings.tolist()
+        return [v.tolist() for v in vectors]
 
     def embed_query(self, text: str) -> list[float]:
-        """Embed a single query string for semantic vector search."""
-        embedding = self._model.encode(text, normalize_embeddings=True)
-        return embedding.tolist()
+        vector = self.model.encode(
+            EMBED_QUERY_PREFIX + text,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        return vector.tolist()
 
 
-# Singleton cached embedder instance
-_cached_embedder: Optional[Embedder] = None
+_EMBEDDER: Embedder | None = None
 
 
-def get_embedder(model_name: Optional[str] = None) -> Embedder:
-    """Get or initialize singleton Embedder instance."""
-    global _cached_embedder
-    target_name = model_name or settings.embed_model
-    if _cached_embedder is None or _cached_embedder.model_name != target_name:
-        _cached_embedder = Embedder(model_name=target_name)
-    return _cached_embedder
+def get_embedder() -> Embedder:
+    """Load the embedder once per process — the model is 2.2GB."""
+    global _EMBEDDER
+    if _EMBEDDER is None:
+        _EMBEDDER = SentenceTransformerEmbedder()
+    return _EMBEDDER

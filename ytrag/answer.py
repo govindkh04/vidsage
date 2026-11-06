@@ -1,174 +1,237 @@
-import logging
+"""Retrieve -> grounded answer + citations.
+
+The important part of this module is what it does when retrieval comes back
+empty: it returns the refusal without calling the LLM at all.
+
+The model knows DSA perfectly well. If it is handed junk context it will
+happily answer from its own training and attach your timestamps to it — the
+student clicks the link and you are talking about something else entirely.
+That is strictly worse than saying "cover nahi hua".
+"""
+
 import re
-from typing import Any, Optional
 
-from ytrag.config import settings
-from ytrag.index import search as qdrant_search
-from ytrag.models import Citation, format_timestamp
-from ytrag.services.groq_service import generate_completion
+from groq import Groq
 
-logger = logging.getLogger("ytrag.answer")
+from ytrag.config import (
+    CONFIDENT_DISTANCE,
+    GEMINI_API_KEY,
+    GEMINI_MODEL,
+    GROQ_API_KEY,
+    GROQ_MODEL,
+    LLM_BACKEND,
+    LLM_MODEL,
+    MAX_DISTANCE,
+    REFUSAL,
+    TOP_K,
+)
+from ytrag.index import search, title_overlap
+from ytrag.models import Chunk
 
-SYSTEM_PROMPT = """You are VidSage, an educational assistant that answers questions using retrieved excerpts from the user's YouTube lectures.
+_CLIENT: Groq | None = None
 
-The retrieved transcripts may contain speech recognition errors.
-Answer only using information directly supported by the supplied lecture excerpts.
-Do not use your general training knowledge to speculate or fill gaps.
-If the excerpts do not clearly explain the requested topic, say:
-'Ye topic in lectures me cover nahi hua.'
+SYSTEM_PROMPT = f"""You are answering using ONLY the transcript excerpts below, which come from
+DSA lectures. The transcripts are auto-generated and may contain
+minor errors — read past obvious mis-transcriptions of technical terms.
 
-Match the language of the user's question.
-For Hinglish questions, answer naturally in Hinglish.
-Keep answers concise and suitable for exam/interview revision (around 4-6 sentences).
-Cite the relevant excerpts using their citation identifiers like [1], [2].
-Never invent lecture titles, video IDs, timestamps, or source links."""
+Rules:
+- Answer only from the excerpts. If they don't cover it, say exactly:
+  "{REFUSAL}"
+- Cite with [1], [2] inline, using the excerpt numbers given below.
+- Match the language of the question (Hinglish question -> Hinglish answer).
+- 4-6 sentences max.
+- Never invent a timestamp or a lecture name."""
 
-
-def extract_citation_indices(text: str) -> list[int]:
-    """Extract 1-based citation indices like [1], [2], [3] from generated answer."""
-    matches = re.findall(r"\[(\d+)\]", text)
-    indices: list[int] = []
-    for m in matches:
-        idx = int(m)
-        if idx not in indices:
-            indices.append(idx)
-    return indices
+_CITATION_RE = re.compile(r"\[(\d+)\]")
 
 
-def build_context_block(retrieved_chunks: list[dict[str, Any]]) -> str:
-    """Format retrieved lecture chunks into a numbered context block for LLM prompting."""
-    blocks: list[str] = []
-    for i, chunk in enumerate(retrieved_chunks, start=1):
-        title = chunk.get("video_title", "Unknown Lecture")
-        start_t = format_timestamp(chunk.get("start_sec", 0))
-        end_t = format_timestamp(chunk.get("end_sec", 0))
-        # Remove title prefix from chunk text to avoid redundancy
-        raw_text = chunk.get("text", "")
-        lines = raw_text.split("\n\n", 1)
-        body = lines[1] if len(lines) > 1 else lines[0]
+def get_client() -> Groq:
+    global _CLIENT
+    if _CLIENT is None:
+        if not GROQ_API_KEY:
+            raise RuntimeError("GROQ_API_KEY is not set. Add it to the repo-root .env.")
+        _CLIENT = Groq(api_key=GROQ_API_KEY)
+    return _CLIENT
 
-        block = (
-            f"[{i}] Lecture: {title}\n"
-            f"Timestamp: {start_t} - {end_t}\n"
-            f"Excerpt:\n{body.strip()}"
+
+def _chat(system: str, user: str) -> str:
+    """One completion, from whichever backend is configured.
+
+    Kept deliberately small: the explanation is a garnish on top of retrieval,
+    so swapping providers should never be more than this function.
+    """
+    backend = LLM_BACKEND.lower()
+
+    if backend == "none":
+        raise RuntimeError(
+            "No AI provider is configured. Add GROQ_API_KEY or GEMINI_API_KEY "
+            "to the project .env file, then restart VidSage."
         )
-        blocks.append(block)
+
+    if backend == "gemini":
+        if not GEMINI_API_KEY:
+            raise RuntimeError("GEMINI_API_KEY is not set.")
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        response = client.models.generate_content(
+            model=LLM_MODEL or GEMINI_MODEL,
+            contents=user,
+            config=types.GenerateContentConfig(
+                system_instruction=system, temperature=0.2
+            ),
+        )
+        return (response.text or "").strip()
+
+    response = get_client().chat.completions.create(
+        model=LLM_MODEL or GROQ_MODEL,
+        messages=[{"role": "system", "content": system},
+                  {"role": "user", "content": user}],
+        temperature=0.2,
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
+def build_context(chunks: list[Chunk]) -> str:
+    blocks = []
+    for i, chunk in enumerate(chunks, start=1):
+        blocks.append(f'[{i}] "{chunk.video_title}" @ {chunk.timestamp}\n{chunk.text}')
     return "\n\n".join(blocks)
+
+
+def _citation(chunk: Chunk, distance: float) -> dict:
+    return {
+        "title": chunk.video_title,
+        "timestamp": chunk.timestamp,
+        "url": chunk.url,
+        "start_sec": chunk.link_sec,
+        "video_id": chunk.video_id,
+        "distance": round(distance, 4),
+    }
+
+
+def _renumber(text: str, hits: list[tuple[Chunk, float]]) -> tuple[str, list[dict]]:
+    """Keep only the citations the model actually used, and renumber them 1..N.
+
+    Without this the student sees six links under an answer that only used
+    one, and stops trusting any of them.
+    """
+    order: list[int] = []
+    for match in _CITATION_RE.finditer(text):
+        idx = int(match.group(1))
+        if 1 <= idx <= len(hits) and idx not in order:
+            order.append(idx)
+
+    if not order:
+        return text, []
+
+    remap = {old: new for new, old in enumerate(order, start=1)}
+    rewritten = _CITATION_RE.sub(
+        lambda m: f"[{remap[int(m.group(1))]}]" if int(m.group(1)) in remap else "",
+        text,
+    )
+    citations = [_citation(*hits[old - 1]) for old in order]
+    return rewritten, citations
 
 
 def answer(
     question: str,
-    top_k: Optional[int] = None,
-    max_distance: Optional[float] = None,
-    rewind_sec: int = 5,
-) -> dict[str, Any]:
-    """Retrieve relevant lecture chunks, apply relevance filtering, generate grounded answer via Groq LLM, and validate citations.
-    
-    Returns:
-        dict: {
-            "question": str,
-            "answer": str,
-            "grounded": bool,
-            "citations": list[dict],
-            "retrieved_count": int,
-        }
-    """
-    settings.validate_for_answering()
-    effective_top_k = top_k if top_k is not None else settings.top_k
-    threshold = max_distance if max_distance is not None else settings.max_distance
+    top_k: int = TOP_K,
+    video_id: str | None = None,
+    max_distance: float | None = None,
+) -> dict:
+    """-> {"answer", "citations", "grounded", "retrieved"}"""
+    question = question.strip()
+    if not question:
+        return {"answer": REFUSAL, "citations": [], "grounded": False, "retrieved": 0}
 
-    # 1. Vector retrieval from Qdrant
-    logger.info(f"Retrieving top {effective_top_k} chunks for: '{question}'")
-    raw_results = qdrant_search(query=question, top_k=effective_top_k)
+    hits = search(question, top_k=top_k, video_id=video_id, max_distance=max_distance)
 
-    if not raw_results:
-        logger.info("Zero chunks retrieved from vector search.")
-        return {
-            "question": question,
-            "answer": "Ye topic in lectures me cover nahi hua.",
-            "grounded": False,
-            "citations": [],
-            "retrieved_count": 0,
-        }
+    # Guard one: nothing survived the distance cutoff, so there is nothing to
+    # ground an answer in. Return the refusal and never call the LLM.
+    if not hits:
+        return {"answer": REFUSAL, "citations": [], "grounded": False, "retrieved": 0}
 
-    # 2. Relevance filtering
-    # In Qdrant Cosine distance, score is cosine similarity in [-1, 1]
-    filtered_results = [r for r in raw_results if r.get("score", 0.0) >= threshold]
-    if not filtered_results:
-        logger.info(
-            f"All retrieved chunks scored below threshold {threshold} "
-            f"(best score: {raw_results[0].get('score', 0):.3f}). Refusing to answer."
-        )
-        return {
-            "question": question,
-            "answer": "Ye topic in lectures me cover nahi hua.",
-            "grounded": False,
-            "citations": [],
-            "retrieved_count": len(raw_results),
-        }
+    chunks = [chunk for chunk, _ in hits]
+    user_prompt = f"EXCERPTS\n{build_context(chunks)}\n\nQUESTION: {question}"
 
-    # 3. Context Construction
-    context_str = build_context_block(filtered_results)
-    user_prompt = (
-        f"Retrieved Lecture Excerpts:\n"
-        f"---------------------------\n"
-        f"{context_str}\n"
-        f"---------------------------\n\n"
-        f"User Question: {question}\n\n"
-        f"Grounded Answer (remember to cite excerpts like [1], [2]):"
-    )
+    text = _chat(SYSTEM_PROMPT, user_prompt)
 
-    # 4. LLM Generation via Groq
-    generated_text = generate_completion(
-        system_prompt=SYSTEM_PROMPT,
-        user_prompt=user_prompt,
-    )
+    # Guard two: the model read the excerpts and said they don't cover it.
+    if REFUSAL.lower() in text.lower():
+        return {"answer": REFUSAL, "citations": [], "grounded": False, "retrieved": len(hits)}
 
-    # 5. Citation Validation
-    # Check if the LLM answered with refusal
-    refusal_markers = [
-        "cover nahi hua",
-        "nahi hua",
-        "not covered",
-        "does not mention",
-        "no information",
-    ]
-    is_refusal = any(marker in generated_text.lower() for marker in refusal_markers)
+    text, citations = _renumber(text, hits)
 
-    cited_indices = extract_citation_indices(generated_text)
-    validated_citations: list[dict[str, Any]] = []
-
-    for idx in cited_indices:
-        if 1 <= idx <= len(filtered_results):
-            source_chunk = filtered_results[idx - 1]
-            vid_id = source_chunk["video_id"]
-            start_s = source_chunk["start_sec"]
-            end_s = source_chunk["end_sec"]
-            # Apply rewind offset for smooth playback navigation
-            rewind_time = max(0, start_s - rewind_sec)
-
-            lines = source_chunk["text"].split("\n\n", 1)
-            excerpt_body = lines[1] if len(lines) > 1 else lines[0]
-
-            citation_data = {
-                "citation_id": f"[{idx}]",
-                "video_id": vid_id,
-                "title": source_chunk["video_title"],
-                "start_sec": start_s,
-                "end_sec": end_s,
-                "timestamp": format_timestamp(start_s),
-                "url": f"https://www.youtube.com/watch?v={vid_id}&t={rewind_time}s",
-                "text": excerpt_body.strip(),
-            }
-            validated_citations.append(citation_data)
-
-    # Grounding status is true only if NOT refusal and at least one valid citation exists
-    grounded = (not is_refusal) and len(validated_citations) > 0
-
+    # Guard three: an answer with no citation at all is the model talking from
+    # its own knowledge. Show it, but don't dress it up with links.
     return {
-        "question": question,
-        "answer": generated_text,
-        "grounded": grounded,
-        "citations": validated_citations,
-        "retrieved_count": len(filtered_results),
+        "answer": text,
+        "citations": citations,
+        "grounded": bool(citations),
+        "retrieved": len(hits),
+    }
+
+
+def retrieve_only(question: str, top_k: int = TOP_K, filtered: bool = False) -> list[tuple[Chunk, float]]:
+    """Retrieval without the LLM — used by evaluate.py and `ytrag search`.
+
+    Unfiltered by default: 2.0 is the maximum possible cosine distance, so
+    nothing is dropped. Eval wants to see what retrieval actually returned,
+    including the results the MAX_DISTANCE cutoff would have thrown away.
+    """
+    return search(question, top_k=top_k, max_distance=None if filtered else 2.0)
+
+def _is_confident(question: str, hits: list[tuple[Chunk, float]]) -> bool:
+    """Is the top result trustworthy enough to present without a caveat?
+
+    Distance alone cannot answer this — measured on the real index, off-topic
+    questions score *better* than some genuine ones ("React hooks" 0.463 beats
+    "number of islands" 0.568), so any single cutoff mislabels one group.
+
+    Two signals together work far better. Either the lecture title actually
+    mentions what was asked, or the match is close enough that the topic is
+    unambiguous even when no title names it.
+    """
+    if not hits:
+        return False
+    chunk, distance = hits[0]
+    return title_overlap(question, chunk.video_title) > 0 or distance <= CONFIDENT_DISTANCE
+
+
+def search_only(question: str, top_k: int = TOP_K, video_id: str | None = None) -> dict:
+    """Retrieval with no LLM at all — the timestamps, ranked.
+
+    This is the main path. The timestamps *are* the product: a student wants
+    to land on the moment the thing was explained, not read a paraphrase of
+    it. Skipping the model makes this instant, free, unlimited, and incapable
+    of hallucinating, since nothing is generated.
+
+    `confident` reports whether the best match is close enough to be worth
+    trusting. It is advisory, not a gate — a weak match still gets shown,
+    because a ranked list the student can dismiss in one glance is far less
+    harmful than a confident sentence that is wrong.
+    """
+    question = question.strip()
+    if not question:
+        return {"results": [], "confident": False, "query": question}
+
+    hits = search(question, top_k=top_k, video_id=video_id)
+    return {
+        "query": question,
+        "confident": _is_confident(question, hits),
+        "results": [
+            {
+                "title": chunk.video_title,
+                "timestamp": chunk.timestamp,
+                "url": chunk.url,
+                "start_sec": chunk.link_sec,
+                "end_sec": chunk.end_sec,
+                "video_id": chunk.video_id,
+                "distance": round(distance, 4),
+                "preview": chunk.text.split(chr(10) + chr(10), 1)[-1][:240].strip(),
+            }
+            for chunk, distance in hits
+        ],
     }
