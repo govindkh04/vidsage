@@ -50,7 +50,7 @@ not call an LLM; the `/ask` endpoint does.
 | Language | Python 3.11 or 3.12 |
 | Dependency management | [uv](https://docs.astral.sh/uv/) |
 | Playlist metadata and audio | `yt-dlp` |
-| Transcription | `faster-whisper` / CTranslate2 |
+| Transcription | `faster-whisper`  |
 | Time-aware chunking | Project implementation in `ytrag/chunk.py` |
 | Local embeddings | `sentence-transformers`; default `all-MiniLM-L6-v2` |
 | Vector database | Qdrant client: embedded local storage or Qdrant Cloud |
